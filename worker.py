@@ -1,8 +1,11 @@
 import os
 import time
 import json
+import threading
+import certifi
 import requests
 from datetime import datetime
+from flask import Flask, jsonify
 from pymongo import MongoClient
 from dotenv import load_dotenv
 
@@ -14,9 +17,14 @@ MONGODB_URI = os.getenv('MONGODB_ATLAS_URI')
 RAPID_API_KEY = os.getenv('RAPID_API_KEY')
 RAPID_API_HOST = os.getenv('RAPID_API_HOST')
 
+# Initialize Flask app
+app = Flask(__name__)
+
 def setup_mongodb_connection():
+    """Establish connection to MongoDB Atlas with proper SSL configuration"""
     try:
-        client = MongoClient(MONGODB_URI)
+        # Use certifi for SSL certificate verification
+        client = MongoClient(MONGODB_URI, tlsCAFile=certifi.where())
         db = client.sports_betting
         return db.bets
     except Exception as e:
@@ -24,6 +32,7 @@ def setup_mongodb_connection():
         raise
 
 def fetch_rapid_api_data():
+    """Fetch data from RapidAPI endpoint"""
     url = "https://sportsbook-api2.p.rapidapi.com/v0/advantages/"
     querystring = {"type": "PLUS_EV_AVERAGE"}
     headers = {
@@ -40,6 +49,7 @@ def fetch_rapid_api_data():
         raise
 
 def process_advantage_data(advantage):
+    """Process individual advantage data"""
     outcomes = advantage.get('outcomes', [])
     participant = outcomes[0].get('participant') if outcomes else None
     implied_probability = advantage.get('marketStatistics', [{}])[0].get('value')
@@ -73,6 +83,7 @@ def process_advantage_data(advantage):
     }
 
 def update_database(collection, bets_data):
+    """Update MongoDB with new betting data"""
     try:
         for bet in bets_data:
             collection.update_one(
@@ -85,31 +96,45 @@ def update_database(collection, bets_data):
         print(f"Database Update Error: {str(e)}")
         raise
 
-def main():
-    print(f"Starting job at {datetime.utcnow()}")
-    
-    try:
-        collection = setup_mongodb_connection()
-        api_data = fetch_rapid_api_data()
-        
-        if not api_data.get('advantages'):
-            print("No advantages data available")
-            return
-        
-        processed_bets = [
-            process_advantage_data(advantage)
-            for advantage in api_data['advantages']
-        ]
-        
-        update_database(collection, processed_bets)
-        print(f"Job completed successfully at {datetime.utcnow()}")
-        
-    except Exception as e:
-        print(f"Job failed: {str(e)}")
-        raise
-
-if __name__ == "__main__":
+def worker():
+    """Background worker function"""
     while True:
-        main()
-        # Wait for 5 minutes before next execution
-        time.sleep(60)
+        print(f"Starting job at {datetime.utcnow()}")
+        try:
+            collection = setup_mongodb_connection()
+            api_data = fetch_rapid_api_data()
+            
+            if not api_data.get('advantages'):
+                print("No advantages data available")
+                time.sleep(300)  # Wait 5 minutes before next attempt
+                continue
+            
+            processed_bets = [
+                process_advantage_data(advantage)
+                for advantage in api_data['advantages']
+            ]
+            
+            update_database(collection, processed_bets)
+            print(f"Job completed successfully at {datetime.utcnow()}")
+            
+        except Exception as e:
+            print(f"Job failed: {str(e)}")
+        
+        time.sleep(60)  # Wait 5 minutes before next execution
+
+# Start background worker thread
+worker_thread = threading.Thread(target=worker, daemon=True)
+worker_thread.start()
+
+@app.route('/')
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.utcnow().isoformat()
+    })
+
+if __name__ == '__main__':
+    # Get port from environment variable for Render compatibility
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
