@@ -160,7 +160,7 @@ def worker():
             
             if not api_data.get('advantages'):
                 print("No advantages data available")
-                time.sleep(300)  # Wait 5 minutes before next attempt
+                time.sleep(60)  # Wait 5 minutes before next attempt
                 continue
             
             processed_bets = [
@@ -178,16 +178,16 @@ def worker():
             if retry_count >= max_retries:
                 print("Max retries reached, waiting for next cycle")
                 retry_count = 0
-                time.sleep(300)
+                time.sleep(60)
             else:
                 time.sleep(30)  # Wait 30 seconds before retry
             continue
             
         except Exception as e:
             print(f"Job failed: {str(e)}")
-            time.sleep(300)  # Wait 5 minutes before next attempt
+            time.sleep(60)  # Wait 5 minutes before next attempt
         
-        time.sleep(300)  # Regular 5-minute interval between runs
+        time.sleep(60)  # Regular 5-minute interval between runs
 
 # Start background worker thread
 worker_thread = threading.Thread(target=worker, daemon=True)
