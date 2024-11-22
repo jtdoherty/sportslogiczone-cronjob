@@ -4,46 +4,42 @@ import json
 import threading
 import certifi
 import requests
+import dns.resolver
 from datetime import datetime
 from flask import Flask, jsonify
 from pymongo import MongoClient, errors
-from urllib.parse import quote_plus
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 
-# Configuration
-MONGODB_URI = os.getenv('MONGODB_ATLAS_URI')
-RAPID_API_KEY = os.getenv('RAPID_API_KEY')
-RAPID_API_HOST = os.getenv('RAPID_API_HOST')
+# Configuration - Use class to prevent variable scope issues
+class Config:
+    MONGODB_URI = os.getenv('MONGODB_ATLAS_URI')
+    RAPID_API_KEY = os.getenv('RAPID_API_KEY')
+    RAPID_API_HOST = os.getenv('RAPID_API_HOST')
+    
+    @classmethod
+    def validate(cls):
+        if not cls.MONGODB_URI:
+            raise ValueError("MONGODB_ATLAS_URI not set in environment")
+        if not cls.RAPID_API_KEY:
+            raise ValueError("RAPID_API_KEY not set in environment")
+        if not cls.RAPID_API_HOST:
+            raise ValueError("RAPID_API_HOST not set in environment")
 
 # Initialize Flask app
 app = Flask(__name__)
 
-def parse_mongodb_uri():
-    """Parse and validate MongoDB URI"""
-    if not MONGODB_URI:
-        raise ValueError("MongoDB URI is not set in environment variables")
-    
-    # Ensure the URI uses SSL
-    if 'ssl=true' not in MONGODB_URI and '?ssl=true' not in MONGODB_URI:
-        if '?' in MONGODB_URI:
-            MONGODB_URI += '&ssl=true'
-        else:
-            MONGODB_URI += '?ssl=true'
-    
-    return MONGODB_URI
-
 def setup_mongodb_connection():
     """Establish connection to MongoDB Atlas with proper SSL configuration"""
     try:
-        # Get properly formatted URI
-        uri = parse_mongodb_uri()
+        # Validate configuration
+        Config.validate()
         
         # Configure MongoDB client with proper SSL settings
         client = MongoClient(
-            uri,
+            Config.MONGODB_URI,
             tls=True,
             tlsCAFile=certifi.where(),
             connectTimeoutMS=30000,
@@ -51,7 +47,8 @@ def setup_mongodb_connection():
             connect=True,
             maxPoolsize=50,
             retryWrites=True,
-            serverSelectionTimeoutMS=30000
+            serverSelectionTimeoutMS=30000,
+            ssl_cert_reqs='CERT_REQUIRED'
         )
         
         # Force a connection to verify it works
@@ -60,12 +57,6 @@ def setup_mongodb_connection():
         
         db = client.sports_betting
         return db.bets
-    except errors.ConnectionFailure as e:
-        print(f"MongoDB Connection Failure: {str(e)}")
-        raise
-    except errors.ServerSelectionTimeoutError as e:
-        print(f"MongoDB Server Selection Timeout: {str(e)}")
-        raise
     except Exception as e:
         print(f"MongoDB Connection Error: {str(e)}")
         raise
@@ -75,8 +66,8 @@ def fetch_rapid_api_data():
     url = "https://sportsbook-api2.p.rapidapi.com/v0/advantages/"
     querystring = {"type": "PLUS_EV_AVERAGE"}
     headers = {
-        "x-rapidapi-key": RAPID_API_KEY,
-        "x-rapidapi-host": RAPID_API_HOST
+        "x-rapidapi-key": Config.RAPID_API_KEY,
+        "x-rapidapi-host": Config.RAPID_API_HOST
     }
 
     try:
@@ -124,6 +115,10 @@ def process_advantage_data(advantage):
 def update_database(collection, bets_data):
     """Update MongoDB with new betting data"""
     try:
+        if not bets_data:
+            print("No bets data to update")
+            return
+
         operations = []
         for bet in bets_data:
             operations.append(
@@ -136,13 +131,9 @@ def update_database(collection, bets_data):
                 }
             )
         
-        if operations:
-            result = collection.bulk_write(operations, ordered=False)
-            print(f"Successfully processed {len(operations)} bets")
-            print(f"Modified: {result.modified_count}, Upserted: {result.upserted_count}")
-    except errors.BulkWriteError as e:
-        print(f"Bulk Write Error: {str(e)}")
-        raise
+        result = collection.bulk_write(operations, ordered=False)
+        print(f"Successfully processed {len(operations)} bets")
+        print(f"Modified: {result.modified_count}, Upserted: {result.upserted_count}")
     except Exception as e:
         print(f"Database Update Error: {str(e)}")
         raise
@@ -155,12 +146,15 @@ def worker():
     while True:
         print(f"Starting job at {datetime.utcnow()}")
         try:
+            # Initialize MongoDB connection
             collection = setup_mongodb_connection()
+            
+            # Fetch and process data
             api_data = fetch_rapid_api_data()
             
             if not api_data.get('advantages'):
                 print("No advantages data available")
-                time.sleep(60)  # Wait 5 minutes before next attempt
+                time.sleep(60)  # Wait 5 minutes
                 continue
             
             processed_bets = [
@@ -168,6 +162,7 @@ def worker():
                 for advantage in api_data['advantages']
             ]
             
+            # Update database
             update_database(collection, processed_bets)
             print(f"Job completed successfully at {datetime.utcnow()}")
             retry_count = 0  # Reset retry count on success
@@ -185,9 +180,9 @@ def worker():
             
         except Exception as e:
             print(f"Job failed: {str(e)}")
-            time.sleep(60)  # Wait 5 minutes before next attempt
+            time.sleep(60)  # Wait 5 minutes
         
-        time.sleep(60)  # Regular 5-minute interval between runs
+        time.sleep(60)  # Regular 5-minute interval
 
 # Start background worker thread
 worker_thread = threading.Thread(target=worker, daemon=True)
@@ -205,7 +200,6 @@ def health_check():
 def worker_status():
     """Worker status endpoint"""
     try:
-        # Test database connection
         collection = setup_mongodb_connection()
         last_update = collection.find_one(
             {},
