@@ -2,7 +2,6 @@ import os
 import time
 import json
 import threading
-import certifi
 import requests
 from datetime import datetime
 from flask import Flask, jsonify
@@ -23,8 +22,20 @@ app = Flask(__name__)
 def setup_mongodb_connection():
     """Establish connection to MongoDB Atlas with proper SSL configuration"""
     try:
-        # Use certifi for SSL certificate verification
-        client = MongoClient(MONGODB_URI, tlsCAFile=certifi.where())
+        # Configure MongoDB client with proper SSL settings
+        client = MongoClient(
+            MONGODB_URI,
+            connectTimeoutMS=30000,
+            socketTimeoutMS=None,
+            connect=True,
+            maxPoolsize=50,
+            retryWrites=True,
+            serverSelectionTimeoutMS=5000
+        )
+        # Force a connection to verify it works
+        client.admin.command('ping')
+        print("Connected successfully to MongoDB Atlas")
+        
         db = client.sports_betting
         return db.bets
     except Exception as e:
@@ -133,6 +144,32 @@ def health_check():
         'status': 'healthy',
         'timestamp': datetime.utcnow().isoformat()
     })
+
+@app.route('/status')
+def worker_status():
+    """Worker status endpoint"""
+    try:
+        # Test database connection
+        collection = setup_mongodb_connection()
+        last_update = collection.find_one(
+            {},
+            {'updated_at': 1},
+            sort=[('updated_at', -1)]
+        )
+        
+        return jsonify({
+            'status': 'healthy',
+            'database_connected': True,
+            'last_update': last_update['updated_at'] if last_update else None,
+            'timestamp': datetime.utcnow().isoformat()
+        })
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'database_connected': False,
+            'error': str(e),
+            'timestamp': datetime.utcnow().isoformat()
+        }), 500
 
 if __name__ == '__main__':
     # Get port from environment variable for Render compatibility
