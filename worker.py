@@ -2,10 +2,12 @@ import os
 import time
 import json
 import threading
+import certifi
 import requests
 from datetime import datetime
 from flask import Flask, jsonify
-from pymongo import MongoClient
+from pymongo import MongoClient, errors
+from urllib.parse import quote_plus
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -19,25 +21,51 @@ RAPID_API_HOST = os.getenv('RAPID_API_HOST')
 # Initialize Flask app
 app = Flask(__name__)
 
+def parse_mongodb_uri():
+    """Parse and validate MongoDB URI"""
+    if not MONGODB_URI:
+        raise ValueError("MongoDB URI is not set in environment variables")
+    
+    # Ensure the URI uses SSL
+    if 'ssl=true' not in MONGODB_URI and '?ssl=true' not in MONGODB_URI:
+        if '?' in MONGODB_URI:
+            MONGODB_URI += '&ssl=true'
+        else:
+            MONGODB_URI += '?ssl=true'
+    
+    return MONGODB_URI
+
 def setup_mongodb_connection():
     """Establish connection to MongoDB Atlas with proper SSL configuration"""
     try:
+        # Get properly formatted URI
+        uri = parse_mongodb_uri()
+        
         # Configure MongoDB client with proper SSL settings
         client = MongoClient(
-            MONGODB_URI,
+            uri,
+            tls=True,
+            tlsCAFile=certifi.where(),
             connectTimeoutMS=30000,
             socketTimeoutMS=None,
             connect=True,
             maxPoolsize=50,
             retryWrites=True,
-            serverSelectionTimeoutMS=5000
+            serverSelectionTimeoutMS=30000
         )
+        
         # Force a connection to verify it works
         client.admin.command('ping')
         print("Connected successfully to MongoDB Atlas")
         
         db = client.sports_betting
         return db.bets
+    except errors.ConnectionFailure as e:
+        print(f"MongoDB Connection Failure: {str(e)}")
+        raise
+    except errors.ServerSelectionTimeoutError as e:
+        print(f"MongoDB Server Selection Timeout: {str(e)}")
+        raise
     except Exception as e:
         print(f"MongoDB Connection Error: {str(e)}")
         raise
@@ -96,19 +124,34 @@ def process_advantage_data(advantage):
 def update_database(collection, bets_data):
     """Update MongoDB with new betting data"""
     try:
+        operations = []
         for bet in bets_data:
-            collection.update_one(
-                {'key': bet['key']},
-                {'$set': bet},
-                upsert=True
+            operations.append(
+                {
+                    'replaceOne': {
+                        'filter': {'key': bet['key']},
+                        'replacement': bet,
+                        'upsert': True
+                    }
+                }
             )
-        print(f"Successfully updated {len(bets_data)} bets")
+        
+        if operations:
+            result = collection.bulk_write(operations, ordered=False)
+            print(f"Successfully processed {len(operations)} bets")
+            print(f"Modified: {result.modified_count}, Upserted: {result.upserted_count}")
+    except errors.BulkWriteError as e:
+        print(f"Bulk Write Error: {str(e)}")
+        raise
     except Exception as e:
         print(f"Database Update Error: {str(e)}")
         raise
 
 def worker():
     """Background worker function"""
+    retry_count = 0
+    max_retries = 3
+    
     while True:
         print(f"Starting job at {datetime.utcnow()}")
         try:
@@ -127,11 +170,24 @@ def worker():
             
             update_database(collection, processed_bets)
             print(f"Job completed successfully at {datetime.utcnow()}")
+            retry_count = 0  # Reset retry count on success
+            
+        except (errors.ConnectionFailure, errors.ServerSelectionTimeoutError) as e:
+            retry_count += 1
+            print(f"Connection error (attempt {retry_count}/{max_retries}): {str(e)}")
+            if retry_count >= max_retries:
+                print("Max retries reached, waiting for next cycle")
+                retry_count = 0
+                time.sleep(300)
+            else:
+                time.sleep(30)  # Wait 30 seconds before retry
+            continue
             
         except Exception as e:
             print(f"Job failed: {str(e)}")
+            time.sleep(300)  # Wait 5 minutes before next attempt
         
-        time.sleep(60)  # Wait 5 minutes before next execution
+        time.sleep(300)  # Regular 5-minute interval between runs
 
 # Start background worker thread
 worker_thread = threading.Thread(target=worker, daemon=True)
